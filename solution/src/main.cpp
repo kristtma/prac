@@ -8,6 +8,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <algorithm>
+#include <random>
 
 #include "json_loader.h"
 #include "request_handler.h"
@@ -22,65 +23,12 @@ namespace po = boost::program_options;
 
 namespace {
 
-// === Ticker ===
-class Ticker : public std::enable_shared_from_this<Ticker> {
-public:
-    using Strand = net::strand<net::io_context::executor_type>;
-    using Handler = std::function<void(std::chrono::milliseconds delta)>;
-
-    Ticker(Strand strand, std::chrono::milliseconds period, Handler handler)
-        : strand_{strand}
-        , period_{period}
-        , handler_{std::move(handler)} {
-    }
-
-    void Start() {
-        last_tick_ = Clock::now();
-        net::dispatch(strand_, [self = shared_from_this()] {
-            self->ScheduleTick();
-        });
-    }
-
-private:
-    void ScheduleTick() {
-        assert(strand_.running_in_this_thread());
-        timer_.expires_after(period_);
-        timer_.async_wait([self = shared_from_this()](sys::error_code ec) {
-            self->OnTick(ec);
-        });
-    }
-
-    void OnTick(sys::error_code ec) {
-        using namespace std::chrono;
-        assert(strand_.running_in_this_thread());
-
-        if (!ec) {
-            auto this_tick = Clock::now();
-            auto delta = duration_cast<milliseconds>(this_tick - last_tick_);
-            last_tick_ = this_tick;
-            try {
-                handler_(delta);
-            } catch (...) {
-            }
-            ScheduleTick();
-        }
-    }
-
-    using Clock = std::chrono::steady_clock;
-
-    Strand strand_;
-    std::chrono::milliseconds period_;
-    net::steady_timer timer_{strand_};
-    Handler handler_;
-    std::chrono::steady_clock::time_point last_tick_;
-};
-
-// === остальной код без изменений ===
 template <typename Fn>
 void RunWorkers(unsigned n, const Fn& fn) {
     n = std::max(1u, n);
     std::vector<std::jthread> workers;
     workers.reserve(n - 1);
+    // Запускаем n-1 рабочих потоков, выполняющих функцию fn
     while (--n) {
         workers.emplace_back(fn);
     }
@@ -88,9 +36,11 @@ void RunWorkers(unsigned n, const Fn& fn) {
 }
 
 bool IsSubPath(fs::path path, fs::path base) {
+    // Приводим оба пути к каноничному виду (без . и ..)
     path = fs::weakly_canonical(path);
     base = fs::weakly_canonical(base);
 
+    // Проверяем, что все компоненты base содержатся внутри path
     for (auto b = base.begin(), p = path.begin(); b != base.end(); ++b, ++p) {
         if (p == path.end() || *p != *b) {
             return false;
@@ -133,6 +83,59 @@ std::string GetMimeType(const std::string& extension) {
     return "application/octet-stream";
 }
 
+class Ticker : public std::enable_shared_from_this<Ticker> {
+public:
+    using Strand = net::strand<net::io_context::executor_type>;
+    using Handler = std::function<void(std::chrono::milliseconds delta)>;
+
+    // Функция handler будет вызываться внутри strand с интервалом period
+    Ticker(Strand strand, std::chrono::milliseconds period, Handler handler)
+        : strand_{strand}
+        , period_{period}
+        , handler_{std::move(handler)} {
+    }
+
+    void Start() {
+            last_tick_ = Clock::now();
+            net::dispatch(strand_, [self = shared_from_this()] {
+                self->ScheduleTick();
+        });
+    }
+
+private:
+    void ScheduleTick() {
+        assert(strand_.running_in_this_thread());
+        timer_.expires_after(period_);
+        timer_.async_wait([self = shared_from_this()](sys::error_code ec) {
+            self->OnTick(ec);
+        });
+    }
+
+    void OnTick(sys::error_code ec) {
+        using namespace std::chrono;
+        assert(strand_.running_in_this_thread());
+
+        if (!ec) {
+            auto this_tick = Clock::now();
+            auto delta = duration_cast<milliseconds>(this_tick - last_tick_);
+            last_tick_ = this_tick;
+            try {
+                handler_(delta);
+            } catch (...) {
+            }
+            ScheduleTick();
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+
+    Strand strand_;
+    std::chrono::milliseconds period_;
+    net::steady_timer timer_{strand_};
+    Handler handler_;
+    std::chrono::steady_clock::time_point last_tick_;
+};
+
 std::string DecodeUrl(std::string_view url){
     std::string result;
     result.reserve(url.size());
@@ -163,37 +166,46 @@ public:
     
     bool HandleRequest(const http::request<http::string_body>& req, 
                       http::response<http::file_body>& res) {
+        // Обрабатываем только GET и HEAD запросы
         if (req.method() != http::verb::get && req.method() != http::verb::head) {
             return false;
         }
         
-        std::string target = DecodeUrl(std::string_view{req.target().data(), req.target().size()});
+        // Проверяем, что путь не начинается с /api/
+        std::string target = DecodeUrl(std::string(req.target()));
         if (target.find("/api/") == 0) {
             return false;
         }
         
+        // Если путь заканчивается на /, добавляем index.html
         if (target.empty() || target.back() == '/') {
             target += "index.html";
         }
         
+        // Убираем начальный слэш
         if (!target.empty() && target[0] == '/') {
             target = target.substr(1);
         }
         
+        // Строим полный путь к файлу
         fs::path file_path = root_path_ / target;
         
+        // Проверяем безопасность пути
         if (!IsSubPath(file_path, root_path_)) {
             return false;
         }
         
+        // Если это директория, пробуем index.html
         if (fs::is_directory(file_path)) {
             file_path /= "index.html";
         }
         
+        // Проверяем существование файла
         if (!fs::exists(file_path) || !fs::is_regular_file(file_path)) {
             return false;
         }
         
+        // Открываем файл
         http::file_body::value_type file;
         sys::error_code ec;
         file.open(file_path.string().c_str(), beast::file_mode::read, ec);
@@ -202,11 +214,15 @@ public:
             return false;
         }
         
+        // Устанавливаем ответ
         res.version(req.version());
         res.result(http::status::ok);
+        
+        // Определяем MIME-тип
         std::string ext = file_path.extension().string();
         res.set(http::field::content_type, GetMimeType(ext));
         
+        // Для HEAD запроса не передаем тело
         if (req.method() == http::verb::head) {
             res.content_length(fs::file_size(file_path));
         } else {
@@ -221,9 +237,8 @@ private:
     fs::path root_path_;
 };
 
-// === Структура аргументов командной строки ===
 struct Args {
-    std::optional<int> tick_period_ms;  // Храним как int
+    std::optional<std::chrono::milliseconds> tick_period;
     std::string config_file;
     std::string www_root;
     bool randomize_spawn_points = false;
@@ -235,30 +250,35 @@ struct Args {
 
     desc.add_options()
         ("help,h", "produce help message")
-        ("tick-period,t", po::value<int>()->value_name("milliseconds"), "set tick period")
-        ("config-file,c", po::value<std::string>(&args.config_file)->value_name("file")->required(), "set config file path")
-        ("www-root,w", po::value<std::string>(&args.www_root)->value_name("dir")->required(), "set static files root")
-        ("randomize-spawn-points", po::bool_switch(&args.randomize_spawn_points), "spawn dogs at random positions");
+        ("tick-period,t", po::value<int>()->value_name("milliseconds"),
+         "set tick period")
+        ("config-file,c", po::value(&args.config_file)->value_name("file")->required(),
+         "set config file path")
+        ("www-root,w", po::value(&args.www_root)->value_name("dir")->required(),
+         "set static files root")
+        ("randomize-spawn-points", po::bool_switch(&args.randomize_spawn_points),
+         "spawn dogs at random positions");
 
     po::variables_map vm;
     try {
         po::store(po::parse_command_line(argc, argv, desc), vm);
+
         if (vm.count("help")) {
             std::cout << desc << std::endl;
             return std::nullopt;
         }
-        
-        if (vm.count("tick-period")) {
-            args.tick_period_ms = vm["tick-period"].as<int>();
-            if (*args.tick_period_ms <= 0) {
-                std::cerr << "Error: tick-period must be positive" << std::endl;
-                return std::nullopt;
-            }
-        }
-        
+
         po::notify(vm);
-    } catch (const po::error& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+
+        if (vm.count("tick-period")) {
+            int period_ms = vm["tick-period"].as<int>();
+            if (period_ms <= 0) {
+                throw std::runtime_error("Tick period must be positive");
+            }
+            args.tick_period = std::chrono::milliseconds(period_ms);
+        }
+    } catch (const std::exception& ex) {
+        std::cerr << ex.what() << std::endl;
         std::cerr << desc << std::endl;
         return std::nullopt;
     }
@@ -266,20 +286,28 @@ struct Args {
     return args;
 }
 
+
+
 }  // namespace
 
 int main(int argc, const char* argv[]) {
-    auto args = ParseCommandLine(argc, argv);
-    if (!args) {
-        return EXIT_FAILURE;
-    }
-
     try {
-        model::Game game = json_loader::LoadGame(args->config_file);
+        auto args_opt = ParseCommandLine(argc, argv);
+        if (!args_opt) {
+            return EXIT_SUCCESS;
+        }
+        auto& args = *args_opt;
 
+        // 1. Загружаем карту из файла и построить модель игры
+        //model::Game game = json_loader::LoadGame(args.config_file);
+        json_loader::ExtraMapDataMap extra_data;
+        model::Game game = json_loader::LoadGame(args.config_file, extra_data);
+
+        // 2. Инициализируем io_context
         const unsigned num_threads = std::thread::hardware_concurrency();
         net::io_context ioc(num_threads);
 
+        // 3. Добавляем асинхронный обработчик сигналов SIGINT и SIGTERM
         net::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait([&ioc](const sys::error_code& ec, [[maybe_unused]] int signal_number) {
             if (!ec) {
@@ -288,49 +316,20 @@ int main(int argc, const char* argv[]) {
             }
         });
 
-        // Создаём strand для синхронизации доступа к API и игровому состоянию
-        auto api_strand = net::make_strand(ioc);
-
-        // Создаём обработчик с нужными флагами
-        http_handler::RequestHandler handler{
-            game, 
-            args->randomize_spawn_points,
-            args->tick_period_ms.has_value()  // is_auto_tick_mode_
-        };
-
-        StaticFileHandler static_handler{args->www_root};
-
-        const auto address = net::ip::make_address("0.0.0.0");
-        constexpr unsigned short port = 8080;
-        const net::ip::tcp::endpoint endpoint{address, port};
+        // 4. Создаём обработчик HTTP-запросов и связываем его с моделью игры
+        http_handler::RequestHandler handler{game, extra_data, args.randomize_spawn_points, args.tick_period.has_value()};
+        // 5. Создаём обработчик статических файлов
+        StaticFileHandler static_handler{args.www_root};
         
-        http_server::ServeHttp(ioc, endpoint, [&handler, &static_handler](auto&& req, auto&& send) {
-            http::response<http::file_body> static_res;
-            if (static_handler.HandleRequest(req, static_res)) {
-                send(std::move(static_res));
-                return;
-            }
-            
-            std::string target = DecodeUrl(std::string_view{req.target().data(), req.target().size()});
-            if (target.find("/api/") == 0) {
-                handler(std::forward<decltype(req)>(req), std::forward<decltype(send)>(send));
-            } else {
-                http::response<http::string_body> not_found_res;
-                not_found_res.version(req.version());
-                not_found_res.result(http::status::not_found);
-                not_found_res.set(http::field::content_type, "text/plain");
-                not_found_res.body() = "File not found";
-                not_found_res.prepare_payload();
-                send(std::move(not_found_res));
-            }
-        });
-
-        // Запуск Ticker'а, если задан период
-        std::shared_ptr<Ticker> ticker;
-        if (args->tick_period_ms.has_value()) {
+        // Создаём strand
+        auto api_strand = net::make_strand(ioc);
+        
+        // Запускаем Ticker, если задан период
+        std::shared_ptr<Ticker> ticker = nullptr;
+        if (args.tick_period.has_value()) {
             ticker = std::make_shared<Ticker>(
                 api_strand,
-                std::chrono::milliseconds(*args->tick_period_ms),
+                *args.tick_period,
                 [&game](std::chrono::milliseconds delta) {
                     for (auto& session : game.GetSessions()) {
                         session.Tick(static_cast<int>(delta.count()));
@@ -340,12 +339,46 @@ int main(int argc, const char* argv[]) {
             ticker->Start();
         }
 
+        // Запустить обработчик HTTP-запросов
+        const auto address = net::ip::make_address("0.0.0.0");
+        constexpr unsigned short port = 8080;
+        const net::ip::tcp::endpoint endpoint{address, port};
+        
+        http_server::ServeHttp(ioc, endpoint, 
+            [&handler, &static_handler, api_strand](auto&& req, auto&& send) {
+                net::dispatch(api_strand, 
+                    [&handler, &static_handler, req = std::forward<decltype(req)>(req), send = std::move(send)]() mutable {
+                        // 1. Сначала пробуем статические файлы
+                        http::response<http::file_body> static_res;
+                        if (static_handler.HandleRequest(req, static_res)) {
+                            send(std::move(static_res));
+                            return;
+                        }
+                        
+                        // 2. Если не статика, проверяем API
+                        std::string target = DecodeUrl(std::string(req.target()));
+                        if (target.find("/api/") == 0) {
+                            handler(std::move(req), std::move(send));
+                        } else {
+                            // Не API и не статика - возвращаем text/plain 404
+                            http::response<http::string_body> not_found_res;
+                            not_found_res.version(req.version());
+                            not_found_res.result(http::status::not_found);
+                            not_found_res.set(http::field::content_type, "text/plain");
+                            not_found_res.body() = "File not found";
+                            not_found_res.prepare_payload();
+                            send(std::move(not_found_res));
+                        }
+                    });
+            });
+
+        // Эта надпись сообщает тестам о том, что сервер запущен и готов обрабатывать запросы
         std::cout << "Server has started..."sv << std::endl;
 
+        // 6. Запускаем обработку асинхронных операций
         RunWorkers(std::max(1u, num_threads), [&ioc] {
             ioc.run();
         });
-
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << std::endl;
         return EXIT_FAILURE;

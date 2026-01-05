@@ -9,9 +9,6 @@ namespace http_handler {
 using namespace model;
 namespace json = boost::json;
 using namespace std::literals;
-// Функция для выбора случайной точки на дороге
-// === ИСПРАВЛЕНО: narrowing conversion ===
-// Возвращает позицию с дробными координатами — для движения собаки
 model::Position GetRandomSpawnPoint(const model::Road& road) {
     static std::random_device rd;
     static std::mt19937 gen(rd());
@@ -19,13 +16,14 @@ model::Position GetRandomSpawnPoint(const model::Road& road) {
     if (road.IsHorizontal()) {
         double x0 = std::min(road.GetStart().x, road.GetEnd().x);
         double x1 = std::max(road.GetStart().x, road.GetEnd().x);
+        // Сужаем диапазон на 0.4 с каждой стороны (ширина дороги)
         double min_x = x0 + 0.4;
         double max_x = x1 - 0.4;
         if (min_x > max_x) {
             min_x = max_x = (x0 + x1) / 2.0;
         }
-        std::uniform_real_distribution<double> dis_x(min_x, max_x);
-        return {dis_x(gen), static_cast<double>(road.GetStart().y)};
+        std::uniform_real_distribution<> dis_x(min_x, max_x);
+        return {dis_x(gen), (road.GetStart().y)};
     } else {
         double y0 = std::min(road.GetStart().y, road.GetEnd().y);
         double y1 = std::max(road.GetStart().y, road.GetEnd().y);
@@ -34,8 +32,8 @@ model::Position GetRandomSpawnPoint(const model::Road& road) {
         if (min_y > max_y) {
             min_y = max_y = (y0 + y1) / 2.0;
         }
-        std::uniform_real_distribution<double> dis_y(min_y, max_y);
-        return {static_cast<double>(road.GetStart().x), dis_y(gen)};
+        std::uniform_real_distribution<> dis_y(min_y, max_y);
+        return {(road.GetStart().x), dis_y(gen)};
     }
 }
 template <typename Fn>
@@ -77,6 +75,7 @@ http_server::StringResponse RequestHandler::HandleGameTick(const http_server::St
         for(auto& session : game_.GetSessions()){
             session.Tick(static_cast<int>(time_delta));
         }
+        game_.Tick(std::chrono::milliseconds(time_delta));
         http_server::StringResponse response;
         response.result(http::status::ok);
         response.set(http::field::content_type, "application/json");
@@ -188,8 +187,8 @@ http_server::StringResponse RequestHandler::HandleApiMaps(const http_server::Str
 http_server::StringResponse RequestHandler::HandleApiMap(const http_server::StringRequest& req) {
     const auto& target = req.target();
     
-    // Извлекаем ID карты из URL (формат: /api/v1/maps/{id})
-    std::string map_id_str = std::string(target.substr(std::string("/api/v1/maps/").size()));
+    // Извлекаем ID карты из URL
+    std::string map_id_str = std::string(target.substr(std::string("/api/v1/maps/"sv).size()));
     
     if (map_id_str.empty()) {
         return MakeBadRequestResponse("Map ID is required");
@@ -250,6 +249,15 @@ http_server::StringResponse RequestHandler::HandleApiMap(const http_server::Stri
     }
     map_obj["offices"] = std::move(offices_array);
     
+    // Безопасное получение lootTypes из extra_map_data_
+    auto it = extra_map_data_.find(*map_id);
+    if (it != extra_map_data_.end()) {
+        map_obj["lootTypes"] = it->second.loot_types;
+    } else {
+        // Если данных нет, возвращаем пустой массив
+        map_obj["lootTypes"] = json::array();
+    }
+    
     http_server::StringResponse response;
     response.result(http::status::ok);
     response.set(http::field::content_type, "application/json");
@@ -306,12 +314,11 @@ bool RequestHandler::IsValidMethod(http::verb method, const std::vector<http::ve
 }
 
 
-// === ИСПРАВЛЕНО: сравнения и starts_with ===
 void RequestHandler::operator()(http_server::StringRequest&& req, std::function<void(http_server::StringResponse&&)> send) {
     auto response = [&]() -> http_server::StringResponse {
         const auto& target = req.target();
         
-        // ✅ Убрано sv — используем const char*
+        // Проверяем, что запрос начинается с /api/
         if (target.starts_with("/api/")) {
             // Обрабатываем API endpoints
             if (target == "/api/v1/maps") {
@@ -321,8 +328,8 @@ void RequestHandler::operator()(http_server::StringRequest&& req, std::function<
                 return HandleApiMaps(req);
             } 
             else if (target.starts_with("/api/v1/maps/")) {
-                if (!IsValidMethod(req.method(), {http::verb::get})) {
-                    return MakeMethodNotAllowedResponse("GET");
+                if (!IsValidMethod(req.method(), {http::verb::get, http::verb::head})) {
+                    return MakeMethodNotAllowedResponse("GET, HEAD");
                 }
                 return HandleApiMap(req);
             }
@@ -357,13 +364,15 @@ void RequestHandler::operator()(http_server::StringRequest&& req, std::function<
                 }
                 return HandlePlayerAction(req);
             }
-            else if (target == "/api/v1/game/tick") {
+            else if(target == "/api/v1/game/tick"){
                 if (!IsValidMethod(req.method(), {http::verb::post})) {
                     return MakeMethodNotAllowedResponse("POST");
                 }
                 return HandleGameTick(req);
             }
             else {
+                // Неизвестный API endpoint
+                //return MakeBadRequestResponse("Invalid API endpoint");
                 return MakeJsonResponse(
                     http::status::bad_request,
                     "badRequest",
@@ -372,6 +381,7 @@ void RequestHandler::operator()(http_server::StringRequest&& req, std::function<
             }
         }
         
+        // Для не-API запросов возвращаем 404
         return MakeJsonResponse(http::status::not_found, "pageNotFound", "Page not found");
     }();
 
@@ -457,8 +467,9 @@ http_server::StringResponse RequestHandler::HandleJoinGame(const http_server::St
         response_obj["posy"] = static_cast<int>(added_dog.GetPosition().y); 
 
         token_to_player_.emplace(token, PlayerInfo{user_name, map_id, player_id});
-        //size_t id_value = (*player.GetId());
-        //response_obj["playerId"] = static_cast<int>(id_value); // или лучше — оставить как size_t в JSON
+        size_t bag_capacity = map->GetBagCapacity();
+        dog.SetBagCapacity(bag_capacity);
+
 
         http_server::StringResponse response;
         response.result(http::status::ok);
@@ -493,7 +504,6 @@ http_server::StringResponse RequestHandler::HandleGameState(const http_server::S
 
     const auto& player_map_id = it->second.map_id;
 
-    // НАХОДИМ СЕССИЮ ПО ID КАРТЫ
     model::GameSession* session = game_.FindSession(player_map_id);
     if (!session) {
         return MakeJsonResponse(
@@ -506,7 +516,6 @@ http_server::StringResponse RequestHandler::HandleGameState(const http_server::S
     json::object players_obj;
     for (const auto& [tok, info] : token_to_player_) {
         if (info.map_id == player_map_id) {
-            // НАХОДИМ СОБАКУ ПО player_id
             const model::Dog* dog = nullptr;
             for (auto& d : session->GetDogs()) {
                 if (d.GetPlayerId() == info.player_id) {
@@ -515,7 +524,7 @@ http_server::StringResponse RequestHandler::HandleGameState(const http_server::S
                 }
             }
             if (!dog) {
-                continue; // пропускаем, если собака не найдена
+                continue; 
             }
             // В нужном месте (например, в HandleJoinGame):
             const auto& pos = dog->GetPosition();
@@ -523,17 +532,34 @@ http_server::StringResponse RequestHandler::HandleGameState(const http_server::S
 
             json::array pos_arr{pos.x, pos.y};
             json::array speed_arr{dog->GetSpeedX(), dog->GetSpeedY()};
-
+            json::array bag_arr;
+            for (const auto& item : dog->GetBag().GetItems()) {
+                bag_arr.push_back(json::object{
+                    {"id", static_cast<int>(item.id)},
+                    {"type", static_cast<int>(item.type)}
+                });
+            }
             players_obj[std::to_string(info.player_id)] = json::object{
                 {"pos", std::move(pos_arr)},
                 {"speed", std::move(speed_arr)},
-                {"dir", std::string(1, dir_char)}
+                {"dir", std::string(1, dir_char)},
+                {"bag", std::move(bag_arr)},
+                {"score", dog->GetScore()}
             };
         }
     }
 
     json::object response_obj;
     response_obj["players"] = std::move(players_obj);
+    json::object lost_objects;
+    for (const auto& loot : session->GetLootItems()) {
+        json::array pos_arr{static_cast<double>(loot.position.x), static_cast<double>(loot.position.y)};
+        lost_objects[std::to_string(loot.id)] = json::object{
+            {"type", static_cast<int>(loot.type)},
+            {"pos", std::move(pos_arr)}
+        };
+    }
+    response_obj["lostObjects"] = std::move(lost_objects);
 
     http_server::StringResponse response;
     response.result(http::status::ok);

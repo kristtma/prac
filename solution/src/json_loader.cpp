@@ -7,7 +7,8 @@ namespace json = boost::json;
 namespace json_loader {
 using model::Coord;
 using model::Dimension;
-model::Game LoadGame(const std::filesystem::path& json_path) {
+
+model::Game LoadGame(const std::filesystem::path& json_path, ExtraMapDataMap& extra_data_out) {
     // Загрузить содержимое файла json_path
     std::ifstream file(json_path);
     if (!file.is_open()) {
@@ -26,9 +27,21 @@ model::Game LoadGame(const std::filesystem::path& json_path) {
     double default_speed = 1.0;
 
     if (root.contains("defaultDogSpeed")) {
-    default_speed = root.at("defaultDogSpeed").as_double();
-    game.SetDefaultDogSpeed(default_speed);
-}
+        default_speed = root.at("defaultDogSpeed").as_double();
+        game.SetDefaultDogSpeed(default_speed);
+    }
+    if (root.contains("lootGeneratorConfig")) {
+        auto& cfg = root.at("lootGeneratorConfig").as_object();
+        double period = cfg.at("period").as_double();
+        double prob = cfg.at("probability").as_double();
+        
+        game.SetLootGeneratorConfig(period, prob);
+    }
+    size_t default_bag_capacity = 3;
+    if (root.contains("defaultBagCapacity")) {
+        default_bag_capacity = root.at("defaultBagCapacity").as_int64();
+        game.SetDefaultBagCapacity(default_bag_capacity);
+    }
     // Обрабатываем массив карт
     auto& maps_array = root.at("maps").as_array();
     for (auto& map_value : maps_array) {
@@ -37,6 +50,9 @@ model::Game LoadGame(const std::filesystem::path& json_path) {
         // Получаем id и name карты
         std::string id_str = json::value_to<std::string>(map_obj.at("id"));
         std::string name = json::value_to<std::string>(map_obj.at("name"));
+        
+        // СОХРАНЯЕМ КОПИЮ ID ДО ПЕРЕМЕЩЕНИЯ
+        std::string map_id_str = id_str;
         
         // Создаем карту
         model::Map::Id map_id{std::move(id_str)};
@@ -50,10 +66,14 @@ model::Game LoadGame(const std::filesystem::path& json_path) {
             Coord x0 = json::value_to<Coord>(road_obj.at("x0"));
             Coord y0 = json::value_to<Coord>(road_obj.at("y0"));
             model::Point start{x0, y0};
+            
             // Установка скорости карты
             if (map_obj.contains("dogSpeed")) {
-                map.SetDogSpeed(map_obj.contains("dogSpeed")? map_obj.at("dogSpeed").as_double() : default_speed);
+                map.SetDogSpeed(map_obj.at("dogSpeed").as_double());
+            } else {
+                map.SetDogSpeed(default_speed);
             }
+            
             // Определяем тип дороги (горизонтальная или вертикальная)
             if (road_obj.contains("x1")) {
                 // Горизонтальная дорога
@@ -101,6 +121,59 @@ model::Game LoadGame(const std::filesystem::path& json_path) {
                 map.AddOffice(model::Office(std::move(office_id), position, offset));
             }
         }
+        
+        size_t loot_types_count = 0;
+        // УДАЛЕНО: boost::json::array loot_types_json; // Эта строка создает конфликт
+
+        // Создаем JSON массив для extra_data вне блока if
+        json::array loot_types_json_array;
+
+        if (map_obj.contains("lootTypes")) {
+            auto& loot_arr = map_obj.at("lootTypes").as_array();
+            loot_types_count = loot_arr.size();
+            
+            // Очищаем существующие типы
+            map.ClearLootTypes();
+            
+            for (auto& loot_type_value : loot_arr) {
+                auto& loot_obj = loot_type_value.as_object();
+                
+                // Используем model::LootType вместо json_loader::LootType
+                model::LootType loot_type;
+                loot_type.name = json::value_to<std::string>(loot_obj.at("name"));
+                loot_type.file = json::value_to<std::string>(loot_obj.at("file"));
+                loot_type.type = json::value_to<std::string>(loot_obj.at("type"));
+                
+                if (loot_obj.contains("rotation")) {
+                    loot_type.rotation = json::value_to<int>(loot_obj.at("rotation"));
+                }
+                if (loot_obj.contains("color")) {
+                    loot_type.color = json::value_to<std::string>(loot_obj.at("color"));
+                }
+                if (loot_obj.contains("scale")) {
+                    loot_type.scale = json::value_to<double>(loot_obj.at("scale"));
+                }
+                
+                // Читаем поле value (если есть)
+                if (loot_obj.contains("value")) {
+                    loot_type.value = json::value_to<int>(loot_obj.at("value"));
+                } else {
+                    loot_type.value = 0; // Значение по умолчанию
+                }
+                
+                map.AddLootType(std::move(loot_type));
+                
+                // Сохраняем также в JSON для extra_data
+                loot_types_json_array.push_back(loot_obj);
+            }
+        }
+
+        // Сохраняем в extra_data используя сохраненную копию ID
+        extra_data_out[map_id_str] = ExtraMapData{std::move(loot_types_json_array)};
+
+        // Устанавливаем только количество в модель
+        map.SetLootTypesCount(loot_types_count);
+        
         // Добавляем карту в игру
         game.AddMap(std::move(map));
     }

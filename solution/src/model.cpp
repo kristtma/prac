@@ -5,7 +5,6 @@
 #include <cassert>
 namespace model {
 using namespace std::literals;
-// Поместите в model.cpp (в namespace model)
 namespace {
     constexpr double ROAD_HALF_WIDTH = 0.4;
 
@@ -241,6 +240,22 @@ void Map::AddOffice(Office office) {
         throw;
     }
 }
+void Game::SetLootGeneratorConfig(double period_sec, double prob) {
+    auto ms = static_cast<int>(period_sec * 1000);
+    loot_gen_.emplace(std::chrono::milliseconds(ms), prob);
+}
+
+void Game::Tick(std::chrono::milliseconds dt) {
+    if (!loot_gen_) return;
+
+    for (auto& session : sessions_) {
+        auto looter_count = session.GetDogs().size();
+        auto loot_count = session.GetLootItems().size();
+        auto new_count = loot_gen_->Generate(dt, static_cast<unsigned>(loot_count), static_cast<unsigned>(looter_count));
+        session.Tick(dt.count(), session.GetMap().GetLootTypesCount(), random_gen_);
+        session.GenerateLoot(new_count, session.GetMap().GetLootTypesCount(), random_gen_);
+    }
+}
 
 void Game::AddMap(Map map) {
     const size_t index = maps_.size();
@@ -293,6 +308,141 @@ model::Player* model::Players::FindByDogIdAndMapId(const Dog::Id& dog_id, const 
     return nullptr;
 }
 
-// Реализация метода для Game
+namespace {
+
+class SessionCollisionProvider : public collision_detector::ItemGathererProvider {
+public:
+    SessionCollisionProvider(GameSession& session) : session_(session) {}
+    
+    size_t ItemsCount() const override {
+        return session_.GetLootItems().size() + session_.GetMap().GetOffices().size();
+    }
+    
+    collision_detector::Item GetItem(size_t idx) const override {
+        const auto& loot_items = session_.GetLootItems();
+        if (idx < loot_items.size()) {
+            // Лут-предметы
+            const auto& loot = loot_items[idx];
+            return collision_detector::Item{
+                geom::Point2D{loot.position.x, loot.position.y},
+                0.0  // Ширина предмета = 0
+            };
+        } else {
+            // Офисы
+            idx -= loot_items.size();
+            const auto& offices = session_.GetMap().GetOffices();
+            if (idx < offices.size()) {
+                const auto& office = offices[idx];
+                return collision_detector::Item{
+                    geom::Point2D{static_cast<double>(office.GetPosition().x),
+                                 static_cast<double>(office.GetPosition().y)},
+                    0.5  // Ширина офиса = 0.5
+                };
+            }
+            throw std::out_of_range("Item index out of range");
+        }
+    }
+    
+    size_t GatherersCount() const override {
+        return session_.GetDogs().size();
+    }
+    
+    collision_detector::Gatherer GetGatherer(size_t idx) const override {
+        const auto& dogs = session_.GetDogs();
+        if (idx >= dogs.size()) {
+            throw std::out_of_range("Gatherer index out of range");
+        }
+        
+        const auto& dog = dogs[idx];
+        // Для коллизий используем половину ширины игрока (0.6 / 2 = 0.3)
+        double gatherer_width = 0.3;
+        
+        // Вычисляем конечную позицию на основе скорости
+        Position end_pos = dog.GetPosition();
+        double speed = std::hypot(dog.GetSpeedX(), dog.GetSpeedY());
+        if (speed > 0) {
+            // Предполагаем движение в течение одного тика (dt)
+            // В реальности dt будет передаваться извне
+            double dt = 0.1; // Примерное значение
+            end_pos.x += dog.GetSpeedX() * dt;
+            end_pos.y += dog.GetSpeedY() * dt;
+        }
+        
+        return collision_detector::Gatherer{
+            geom::Point2D{dog.GetPosition().x, dog.GetPosition().y},
+            geom::Point2D{end_pos.x, end_pos.y},
+            gatherer_width
+        };
+    }
+    
+private:
+    GameSession& session_;
+};
+
+}  // namespace
+
+void GameSession::ProcessCollisions(double dt) {
+    auto provider = std::make_unique<SessionCollisionProvider>(*this);
+    auto events = collision_detector::FindGatherEvents(*provider);
+    
+    // Сортируем события по времени
+    std::sort(events.begin(), events.end(),
+        [](const collision_detector::GatheringEvent& a,
+           const collision_detector::GatheringEvent& b) {
+            return a.time < b.time;
+        });
+    
+    // Обрабатываем события в хронологическом порядке
+    for (const auto& event : events) {
+        auto& dogs = GetDogs();
+        if (event.gatherer_id >= dogs.size()) continue;
+        
+        Dog& dog = dogs[event.gatherer_id];
+        const auto& loot_items = GetLootItems();
+        const auto& offices = map_.GetOffices();
+        
+        if (event.item_id < loot_items.size()) {
+            // Столкновение с лут-предметом
+            LootItem& loot = const_cast<LootItem&>(loot_items[event.item_id]);
+            if (!dog.GetBag().IsFull()) {
+                CollectLoot(dog, loot);
+            }
+        } else {
+            // Столкновение с офисом
+            size_t office_idx = event.item_id - loot_items.size();
+            if (office_idx < offices.size()) {
+                ReturnLootToOffice(dog, offices[office_idx]);
+            }
+        }
+    }
+}
+
+void GameSession::CollectLoot(Dog& dog, LootItem& loot) {
+    if (dog.GetBag().TryAddItem(loot.id, loot.type)) {
+        // Удаляем лут из игры
+        auto& loot_items = GetLootItems();
+        auto it = std::find_if(loot_items.begin(), loot_items.end(),
+            [&loot](const LootItem& item) { return item.id == loot.id; });
+        
+        if (it != loot_items.end()) {
+            loot_items.erase(it);
+        }
+    }
+}
+
+void GameSession::ReturnLootToOffice(Dog& dog, const Office& office) {
+    (void)office;
+    
+    auto returned_items = dog.GetBag().Clear();
+    if (!returned_items.empty()) {
+        // Начисляем очки за каждый сданный предмет
+        for (const auto& item : returned_items) {
+            // Получаем стоимость предмета из конфигурации карты
+            int item_value = map_.GetLootValue(item.type);
+            dog.AddScore(item_value);
+        }
+    }
+}
+
 
 }  // namespace model

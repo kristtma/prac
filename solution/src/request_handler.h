@@ -7,7 +7,7 @@
 
 #include <memory>
 #include <optional> 
-
+#include "json_loader.h"
 #include "player_tokens.h"
 namespace http_handler {
 namespace beast = boost::beast;
@@ -15,8 +15,9 @@ namespace http = beast::http;
 class RequestHandler {
 public:
     // Конструктор с правильным порядком параметров
-    explicit RequestHandler(model::Game& game, bool randomize_spawn_points, bool is_auto_tick_mode)
+    explicit RequestHandler(model::Game& game, const json_loader::ExtraMapDataMap& extra_data, bool randomize_spawn_points, bool is_auto_tick_mode)
         : game_(game)
+        , extra_map_data_(extra_data)
         , randomize_spawn_points_(randomize_spawn_points)
         , is_auto_tick_mode_(is_auto_tick_mode)
         , player_tokens_(std::make_unique<PlayerTokens>())
@@ -28,6 +29,7 @@ public:
 
 private:
     model::Game& game_;
+    const json_loader::ExtraMapDataMap& extra_map_data_;
     bool randomize_spawn_points_;  // Порядок: сначала этот параметр
     bool is_auto_tick_mode_;       // Затем этот
     struct PlayerInfo {
